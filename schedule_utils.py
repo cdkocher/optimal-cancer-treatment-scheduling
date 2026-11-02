@@ -519,6 +519,10 @@ def GDRSanalytical(y0,treatmentschedule,timepercycle, gamma, delta, r, s, cureth
 
 ################################################### Simulated annealing code ################################
 
+#from decimal import Decimal, getcontext
+
+#getcontext().prec = 75
+
 progthresh = 2e12
 curethresh = 1
 
@@ -530,17 +534,25 @@ def PFStime(tvals,yvals):
 
     return min(progresstimes)
 
+# function for finding the minimum tumor burden of a given schedule
+def mintumorburden(tvals,yvals):
+    return min([yy[0] for yy in yvals])
+
 # the energy functions. When calculating the min population and the PFS time, it's helpful to round because numerical precision can slightly affect the results. That is, if we are picking out one single optimal schedule, and that schedule just happens to differ by 1e-10 of a day/cell from all the others that it is actually tied with, then that schedule will win, in spite of tiebreakers.
 # energy starts at about 30. Gets down to about 15.
 def cureE(y,t):
     return np.log(1 + min([yy[0] for yy in y])) # need to log1p this so the energy decreases to zero on a reasonable scale as we reach the best y
+    # use decimal package to keep things accurate?
+    #return (1 + Decimal(min([yy[0] for yy in y]))).ln() 
 
 def PFSE(y,t):
     if min([yy[0] for yy in y]) <= curethresh:
         # we cured, so set energy = 0
         return 0
-        
+
     return 100 / np.log(1 + min([tt for yy,tt in zip(y,t) if yy[0] >= progthresh])) # need to do the log1p and inverse here so the energy decreases to zero on a reasonable scale
+    # use the decimal package to keep things accurate?
+    #return Decimal(100) / (Decimal(1) + Decimal(min([tt for yy,tt in zip(y,t) if yy[0] >= progthresh]))).ln()
 
 def PFSEinv(E):
     # invert the above PFS energy to find the pfs
@@ -563,17 +575,28 @@ def regularize(y0,schedule,timepercycle,gamma,delta,r,s):
 
     # now check to see if the schedule is too long
     eventtime = min([tt for yy,tt in zip(newy,newt) if yy[0] >= progthresh or yy[0] <= curethresh])
-    if eventtime // timepercycle < len(schedule) - 2:
+    if eventtime // timepercycle <= len(schedule) - 2:
         # it doesn't happen in the second to last window
         schedule = schedule[:int(eventtime // timepercycle)+1] + [set()]
+
+    # manually set last window to set() because now the last window is after the event time and we cannot have any drug there
+    #schedule[-1] = set()
 
     return schedule
 
 def acceptanceprobability(Eold,Enew,oldschedule,newschedule,beta,metric,newtime,oldtime):
+    # return the acceptance probability
+    # if the old one is worse, then return a probability > 1, which tells us that the move should be accepted
+    #if Eold > Enew:
+    #    return 1.2
+        
     pnaive = np.exp(-beta * (Enew - Eold)) # if Enew > Eold, then we have exp(negative) < 1 as we should
+    # use decimal for accuracy?
+    #pnaive = (Decimal(-beta) * (Enew - Eold)).exp()
     if Enew == Eold:
         # we have a tie
         tiesettled = 0
+        pnaive = 1 # set this so we aren't using Decimal
         # if cure, and one of these cures, settle it by cure time
         # also do this if PFS and energy = 0, which means that cure time has been hit
         #if metric == 'CURE' and (newtime < np.inf or oldtime < np.inf):
@@ -587,11 +610,21 @@ def acceptanceprobability(Eold,Enew,oldschedule,newschedule,beta,metric,newtime,
         if not tiesettled:
             newnumberdrugsused = len(newschedule) - newschedule.count(set()) # number of treatment windows using drug is total - number not using
             oldnumberdrugsused = len(oldschedule) - oldschedule.count(set())
-            pnaive = pnaive * (oldnumberdrugsused + 1) / (newnumberdrugsused + 1) # number of drugs used in the old schedule / number of drugs used in the new schedule > 1 when new schedule uses less (e.g. when it is better). Added one to numerator and denominator so there is no divide by zero error
+            factor = (oldnumberdrugsused + 1) / (newnumberdrugsused + 1)
+            pnaive = pnaive * factor # number of drugs used in the old schedule / number of drugs used in the new schedule > 1 when new schedule uses less (e.g. when it is better). Added one to numerator and denominator so there is no divide by zero error
+            if factor != 1:
+                tiesettled = 1
+
+        # if still tied, settle it by minimizing the number of drug switches. If still not settled, neither schedule is preferred
+        if not tiesettled:
+            newnumberswitches = sum([1 for kk in range(len(newschedule) - 1) if newschedule[kk+1] != newschedule[kk]])
+            oldnumberswitches = sum([1 for kk in range(len(oldschedule) - 1) if oldschedule[kk+1] != oldschedule[kk]])
+            factor = (oldnumberswitches + 1) / (newnumberswitches + 1)
+            pnaive = pnaive * factor
 
     return pnaive
 
-def betafxn(beta0,t,ncycles):
+def betafxn1(beta0,t,ncycles):
     # calculate beta given that we started at beta0 and now are at step t / ncycles
     if t < ncycles / 4:
         return beta0
@@ -599,6 +632,13 @@ def betafxn(beta0,t,ncycles):
     # otherwise, do some exponential growing
     growthfactor = 10
     return beta0 * np.exp(growthfactor * (t / ncycles - 1/4))
+
+def betafxn2(beta0,t,ncycles):
+    # calculate beta given that we started at beta0 and now are at step t / ncycles
+    # use this one for the reheat, where we don't have the waiting period
+    # just exponential growth
+    growthfactor = 7.5
+    return beta0 * np.exp(growthfactor * (t / ncycles))
 
 def calculatecuretime(t,y):
     tomin = [tt for tt,yy in zip(t,y) if yy[0] <= curethresh]
@@ -608,11 +648,11 @@ def calculatecuretime(t,y):
     return min(tomin)
 
 # the full optimization function
-def optimize(params,metric='CURE',timepercycle=7,strategystart=None,ncycles=10000,beta0=0.01,waitperiod=True,storeallschedules=False):
+def optimize(params,metric='CURE',timepercycle=7,strategystart=None,ncycles=10000,beta0=0.01,waitperiod=True,storeallschedules=False,betaoption=1,cleancureflag=False):
     # uses simulated annealing to find the optimal strategy
     # can start with any strategy (to run again)
     # nwindows updates dynamically
-    # TO DO: need a param for annealing schedule, which should be sigmoidal in temp. Need an option to return the energy, or maybe plot on/off
+    # TO DO for extra control: need a param for annealing schedule, which should be sigmoidal in temp. Need an option to return the energy, or maybe plot on/off
 
     # unpack params
     gamma = params[0]
@@ -637,6 +677,11 @@ def optimize(params,metric='CURE',timepercycle=7,strategystart=None,ncycles=1000
     else:
         # PFS
         Efxn = PFSE
+
+    if betaoption == 2:
+        betafxn = betafxn2
+    else:
+        betafxn = betafxn1
 
     # initialize values
     y0 = [1e12] + [1 for kk in range(len(delta))]
@@ -665,7 +710,7 @@ def optimize(params,metric='CURE',timepercycle=7,strategystart=None,ncycles=1000
         replaceddrug = testschedule[tomodifyind]
         testschedule[tomodifyind] = newdrug # for this one
         # if newdrug is set() and waiting period is on, then check to see if we can insted push the current drug forward or backward by one cycle
-        # we want to do this because we need e.g. [{0},set(),set(),...,set(),{0},set()] to be adjacent to both [{0},set(),set(),...,{0},set(),set()] and [{0},set(),set(),...,set(),set(),{0}] for better searching of the space
+        # we want to do this because we need e.g. [{0},set(),set(),...,set(),set(),{0},set()] to be adjacent to both [{0},set(),set(),...,set(),{0},set(),set()] and [{0},set(),set(),...,set(),set(),set(),{0}] for better searching of the space
         if newdrug == set():
             if waitperiod:
                 # if there is a wait period, then have to check 2 in front and 2 behind
@@ -751,6 +796,7 @@ def optimize(params,metric='CURE',timepercycle=7,strategystart=None,ncycles=1000
         energies.append(currentE + 0)
         if storeallschedules:
             allschedulestorage.append(copy.deepcopy(currentstrategy))
+            
         # if we accepted the change, see if optimal strategy changed
         if changeaccepted and acceptanceprobability(optimalE,currentE,optimalstrategy,currentstrategy,beta,metric,currentEtime,optimalEtime) > 1:
             # it is better
@@ -758,6 +804,74 @@ def optimize(params,metric='CURE',timepercycle=7,strategystart=None,ncycles=1000
             optimalstrategy = copy.deepcopy(currentstrategy)
             optimalEtime = copy.deepcopy(currentEtime)
 
+    # the landscape we are searching for the optimum is noisy and bumpy. Therefore, we can sometimes converge on the right idea for the optimum without finding 
+    # the exact optimum. To handle this, we will try a "cleaned" version of the outputted schedule, where we average over the time between doses (rounding to the 
+    # two nearest whole numbers). We take the better one of these and then use it in "bursts" to try to reach cure.
+    # if this "burst" like schedule is better, we report it as the optimum. This is ok if we always run the optimizer in a loop, so that
+    # there is convergence to the same schedule upon reheating and trying to optimize.
+    # we only do this for the case of a single drug
+    if len(delta) == 1:
+        standardizedstrategy = standardize_optimum(optimalstrategy,metric,[gamma,delta,r,s],timepercycle,waitperiod=waitperiod,beta0=beta0)
+        # now test the schedule against the optimum
+        standardizedanalyticalt,standardizedanalyticaly = GDRSanalytical(y0,standardizedstrategy,timepercycle, gamma, delta, r, s)
+        optimalt,optimaly = GDRSanalytical(y0,optimalstrategy,timepercycle, gamma, delta, r, s)
+        optimalE = Efxn(optimaly,optimalt)
+        standardizedE = Efxn(standardizedanalyticaly,standardizedanalyticalt)
+        optimalEtime = calculatecuretime(optimalt,optimaly)
+        standardizedEtime = calculatecuretime(standardizedanalyticalt,standardizedanalyticaly)
+        pacceptstandardizedcomptooptimal = acceptanceprobability(optimalE,standardizedE,optimalstrategy,standardizedstrategy,beta0,metric,standardizedEtime,optimalEtime)
+        if pacceptstandardizedcomptooptimal >= 1:
+            # standardized is better, accept it
+            optimalstrategy = copy.deepcopy(standardizedstrategy)
+            # append to output variables
+            energies.append(standardizedE + 0)
+            if storeallschedules:
+                allschedulestorage.append(copy.deepcopy(optimalstrategy))
+
+    # similarly, if the metric is PFS, we want to help convergence over reheat cycles by testing the addition of doses on the end of the found schedule
+    # these would strictly increase PFS if there is no dose. By the structure of the code, optimalstrategy[-1] = set() always, so the last
+    # window of the actual schedule is optimalstrategy[-2]. Pick a random drug to add
+    if metric == 'PFS':
+        if (not waitperiod and optimalstrategy[-2] == set()) or (waitperiod and optimalstrategy[-2] == set() and optimalstrategy[-3] == set()):
+            # no dose there
+            toadddrug = np.random.randint(0,len(delta))
+            newstrategy = copy.deepcopy(optimalstrategy)
+            newstrategy[-2] = {toadddrug}
+            newstrategy = regularize(y0,newstrategy,timepercycle,gamma,delta,r,s)
+            # now test the schedule against the optimum
+            newanalyticalt,newanalyticaly = GDRSanalytical(y0,newstrategy,timepercycle, gamma, delta, r, s)
+            optimalt,optimaly = GDRSanalytical(y0,optimalstrategy,timepercycle, gamma, delta, r, s)
+            optimalE = Efxn(optimaly,optimalt)
+            newE = Efxn(newanalyticaly,newanalyticalt)
+            optimalEtime = calculatecuretime(optimalt,optimaly)
+            newEtime = calculatecuretime(newanalyticalt,newanalyticaly)
+            pacceptnewcomptooptimal = acceptanceprobability(optimalE,newE,optimalstrategy,newstrategy,beta0,metric,newEtime,optimalEtime)
+            if pacceptnewcomptooptimal >= 1:
+                # standardized is better, accept it
+                optimalstrategy = copy.deepcopy(newstrategy)
+                # append to output variables
+                energies.append(newE + 0)
+                if storeallschedules:
+                    allschedulestorage.append(copy.deepcopy(optimalstrategy))
+
+    # if the metric is cure, then we need to cut all doses after the minimum of the optimal strategy, because that schedule loses the tiebreaker to one without the doses
+    # however, to help with the searching, allow this to be turned on and off, so that we can first loop through with it off which keeps the search space more connected
+    if metric == 'CURE' and cleancureflag:
+        optimalt,optimaly = GDRSanalytical(y0,optimalstrategy,timepercycle, gamma, delta, r, s)
+        mint = optimalt[optimaly.index(min(optimaly))]
+        cycleindxofmin = int(mint // timepercycle)
+        optimalstrategy = optimalstrategy[:cycleindxofmin + 1] + [set() for kk in range(len(optimalstrategy) - cycleindxofmin - 1)]
+        optimalstrategy = regularize(y0,optimalstrategy,timepercycle,gamma,delta,r,s) # regularize the schedule when we are done so it plots nicely
+        optimalt,optimaly = GDRSanalytical(y0,optimalstrategy,timepercycle, gamma, delta, r, s)
+        optimalE = Efxn(optimaly,optimalt)
+        # append to output variables
+        energies.append(optimalE + 0)
+        if storeallschedules:
+            allschedulestorage.append(copy.deepcopy(optimalstrategy))
+
+    # regularize one more time, just in case
+    optimalstrategy = regularize(y0,optimalstrategy,timepercycle,gamma,delta,r,s)
+    
     if storeallschedules:
         return optimalstrategy,energies,allschedulestorage
         
@@ -779,14 +893,15 @@ def standardize_optimum(strategy,metric,params,timepercycle,waitperiod=True,beta
         Efxn = PFSE
 
     givenE = Efxn(analyticaly,analyticalt)
-    if metric == 'CURE':
-        # cut all that are after nadir
-        yvals = [yy[0] for yy in analyticaly]
-        miny = min(yvals)
-        mint = analyticalt[yvals.index(miny)]   
-        mintcycleindx = int(mint // timepercycle) # // makes it so we get the index in which it happens. if the min is achieved in the first window, this gives 0, the index in strategy that this happens
-        # replace with set() if after mintcycleindx
-        standardstrategy = standardstrategy[:mintcycleindx+1] + [set() for kk in range(mintcycleindx+1,len(standardstrategy))]
+    # we now do this in a different spot
+    #if metric == 'CURE':
+    #    # cut all that are after nadir
+    #    yvals = [yy[0] for yy in analyticaly]
+    #    miny = min(yvals)
+    #    mint = analyticalt[yvals.index(miny)]   
+    #    mintcycleindx = int(mint // timepercycle) # // makes it so we get the index in which it happens. if the min is achieved in the first window, this gives 0, the index in strategy that this happens
+    #    # replace with set() if after mintcycleindx
+    #    standardstrategy = standardstrategy[:mintcycleindx+1] + [set() for kk in range(mintcycleindx+1,len(standardstrategy))]
 
     # identify the period where drug is used
     lastdrugindx = len(standardstrategy) - 1
@@ -816,8 +931,6 @@ def standardize_optimum(strategy,metric,params,timepercycle,waitperiod=True,beta
         waitperiodaddition = 1 # need to add the buffer if we have a waiting period, just makes this a bit easier.
 
     ndrugsused = standardstrategy.count({0})
-    # THIS IS WRONG: need to do average of the number of windows between drugs used. This should get rid of the need to do the waitpreiod thing.
-    #windowsperdrug = (lastdrugindx - firstdrugindx) / (ndrugsused + waitperiodaddition) # note that we have specified to a single drug 
     drugwindows = np.array([kk for kk in range(len(standardstrategy)) if standardstrategy[kk] == {0}]) # we have specified to a single drug, but this should be easy to generalize? find avg space between all drugs and then deal with collisions
     windowsperdrug = np.mean(np.diff(drugwindows).tolist())
     wpdplus = int(np.ceil(windowsperdrug))
@@ -837,32 +950,15 @@ def standardize_optimum(strategy,metric,params,timepercycle,waitperiod=True,beta
     pacceptpluscompminus = acceptanceprobability(Eminus,Eplus,standardstrategyminus,standardstrategyplus,beta0,metric,Etimeplus,Etimeminus)
     if pacceptpluscompminus < 1:
         # - is better
-        standardstrategy = standardstrategyminus
+        standardizedstrategy = standardstrategyminus
     else:
         # + is better
-        standardstrategy = standardstrategyplus
+        standardizedstrategy = standardstrategyplus
 
-    # above, we've standardized cure by eliminating extra drug windows. We've also standardized E-type and MTD by regularizing the intervals in between
-    # final thing is to attempt the T-type AT strategy using the information provided. This way, if T-type is the optimum, then we are trying it out. 
-    # in reality, we should add these three standard strategies as "initial checks" before doing the SA. That way, if one is optimal, it is guaranteed to be found...
-    
-    return standardstrategy
-
-def get_final_optimum(strategy,metric,params,timepercycle,waitperiod=True,beta0=0.01,reporting=False):
-    # find the optimal strategy from these options: Simulated annealing output, standardized version of SA output, continuous MTD, and T-type AT
-    # this only works for a single drug
-
-    y0 = [1e12] + [1 for kk in params[1]] # starting values
-    # strategy is the SA optimum
-    SAanalyticalt,SAanalyticaly = GDRSanalytical(y0,strategy,timepercycle, *params) # calculate what happens with this schedule
-    
-    # Find the standardized version
-    standardizedstrategy = standardize_optimum(strategy,metric,params,timepercycle,waitperiod=waitperiod)
     standardizedanalyticalt,standardizedanalyticaly = GDRSanalytical(y0,standardizedstrategy,timepercycle, *params) # calculate what happens with this schedule
-    
     # if metric is cure, then we need to peel off all doses after the minimum
     if metric == 'CURE':
-        # run the strategy an additional number of times to make sure we are actually capturing the minimum...
+        # run the strategy an additional number of times to make sure we are actually capturing the minimum.
         standardizedstrategy = sum([standardizedstrategy for kk in range(5)],[])
         standardizedanalyticalt,standardizedanalyticaly = GDRSanalytical(y0,standardizedstrategy,timepercycle, *params) # calculate what happens with this schedule
         mint = standardizedanalyticalt[standardizedanalyticaly.index(min(standardizedanalyticaly))]
@@ -880,122 +976,8 @@ def get_final_optimum(strategy,metric,params,timepercycle,waitperiod=True,beta0=
             standardizedstrategy = standardizedstrategy + [set(),set(),set()]
             standardizedstrategy = sum([standardizedstrategy for kk in range(repetitionsneeded)],[])
             standardizedstrategy = regularize(y0,standardizedstrategy,timepercycle,*params) # regularize the schedule when we are done so it plots nicely
-            standardizedanalyticalt,standardizedanalyticaly = GDRSanalytical(y0,standardizedstrategy,timepercycle, *params) # calculate what happens with this schedule
-
-    # find the continuous MTD schedule
-    startingnumberofwindows = 10
-    if waitperiod:
-        MTDstrategy = sum([[{0},set()] for kk in range(startingnumberofwindows)],[])
-    else:
-        MTDstrategy = [{0} for kk in range(startingnumberofwindows)]
-        
-    MTDanalyticalt,MTDanalyticaly = GDRSanalytical(y0,MTDstrategy,timepercycle, *params) # calculate what happens with this schedule
-    while MTDanalyticaly[-1][0] < progthresh and MTDanalyticaly[-1][0] > curethresh:
-        # if we haven't progressed / cured, add windows
-        if waitperiod:
-            MTDstrategy = MTDstrategy + [{0},set()]
-        else:
-            MTDstrategy = MTDstrategy + [{0}]
-
-        MTDanalyticalt,MTDanalyticaly = GDRSanalytical(y0,MTDstrategy,timepercycle, *params) # calculate what happens with this schedule
-
-    # if metric is cure, then we need to peel off all doses after the minimum
-    if metric == 'CURE':
-        mint = MTDanalyticalt[MTDanalyticaly.index(min(MTDanalyticaly))]
-        cycleindxofmin = int(mint // timepercycle)
-        MTDstrategy = MTDstrategy[:cycleindxofmin + 1] + [set() for kk in range(len(MTDstrategy) - cycleindxofmin - 1)]
-        
-    MTDstrategy = regularize(y0,MTDstrategy,timepercycle,*params) # regularize the schedule when we are done so it plots nicely
-    MTDanalyticalt,MTDanalyticaly = GDRSanalytical(y0,MTDstrategy,timepercycle, *params)
-    # find the T-type AT schedule
-    maxnumberofwindows = 1000 # stop the AT when we hit this so we don't loop forever
-    ### CHANGED THE DEFINITION HERE. AT STARTS WITH A DOSE
-    #ATstrategy = [set()] # try nothing first
-    if waitperiod:
-        ATstrategy = [{0},set()]
-    else:
-        ATstrategy = [{0}]
-        
-    ATanalyticalt,ATanalyticaly = GDRSanalytical(y0,ATstrategy,timepercycle, *params) # calculate what happens with this schedule
-    #if ATanalyticaly[-1][0] >= progthresh:
-        ## progressed, so need to dose first
-        #if waitperiod:
-        #    ATstrategy = [[{0},set()]]
-        #else:
-        #    ATstrategy = [{0}]
-            
-    while (ATanalyticaly[-1][0] < progthresh and ATanalyticaly[-1][0] > curethresh) and len(ATstrategy) < maxnumberofwindows:
-        # check for next window progression
-        ATstrategy = ATstrategy + [set()]
-        ATanalyticalt,ATanalyticaly = GDRSanalytical(y0,ATstrategy,timepercycle, *params) # calculate what happens with this schedule
-        if ATanalyticaly[-1][0] >= progthresh:
-            # progressed, so need to dose first
-            if waitperiod:
-                ATstrategy = ATstrategy[:-1] + [{0},set()]
-            else:
-                ATstrategy = ATstrategy[:-1] + [{0}]
-
-            # calculate again with the new schedule
-            ATanalyticalt,ATanalyticaly = GDRSanalytical(y0,ATstrategy,timepercycle, *params)
-
-    ATstrategy = regularize(y0,ATstrategy,timepercycle,*params) # regularize the schedule when we are done so it plots nicely
-    ATanalyticalt,ATanalyticaly = GDRSanalytical(y0,ATstrategy,timepercycle, *params)
-    # compare them all
-    if metric == 'CURE':
-        Efxn = cureE
-    else:
-        # PFS
-        Efxn = PFSE
-
-    # calculate E and t vals for the comparison
-    SAE = Efxn(SAanalyticaly,SAanalyticalt)
-    standardizedE = Efxn(standardizedanalyticaly,standardizedanalyticalt)
-    MTDE = Efxn(MTDanalyticaly,MTDanalyticalt)
-    ATE = Efxn(ATanalyticaly,ATanalyticalt)
-    SAEtime = calculatecuretime(SAanalyticalt,SAanalyticaly)
-    standardizedEtime = calculatecuretime(standardizedanalyticalt,standardizedanalyticaly)
-    MTDEtime = calculatecuretime(MTDanalyticalt,MTDanalyticaly)
-    ATEtime = calculatecuretime(ATanalyticalt,ATanalyticaly)
-    # first compare standardized SA (challenger) to SA (incumbent)
-    pacceptstandardizedcomptoSA = acceptanceprobability(SAE,standardizedE,strategy,standardizedstrategy,beta0,metric,standardizedEtime,SAEtime)
-    if pacceptstandardizedcomptoSA < 1:
-        winner1 = strategy # SA better than standardized
-        winner1E = SAE
-        winner1Etime = SAEtime
-    else:
-        winner1 = standardizedstrategy # standardized better than SA
-        winner1E = standardizedE
-        winner1Etime = standardizedEtime
-
-    # no matter who won, it's e type
-    reporter1 = 'E'
-        
-    # Now MTD (incumbent) to AT (challenger)
-    pacceptATcomptoMTD = acceptanceprobability(MTDE,ATE,MTDstrategy,ATstrategy,beta0,metric,ATEtime,MTDEtime)
-    if pacceptATcomptoMTD < 1:
-        winner2 = MTDstrategy # MTD better than AT
-        winner2E = MTDE
-        winner2Etime = MTDEtime
-        reporter2 = 'MTD'
-    else:
-        winner2 = ATstrategy # AT better than MTD
-        winner2E = ATE
-        winner2Etime = ATEtime
-        reporter2 = 'T'
-        
-    # now compare winner1 (incumbent) vs winner2 (challenger)
-    pacceptwinners = acceptanceprobability(winner1E,winner2E,winner1,winner2,beta0,metric,winner2Etime,winner1Etime)
-    if pacceptwinners < 1:
-        optimum = winner1 # winner1 better than winner2
-        reporter = reporter1
-    else:
-        optimum = winner2 # winner2 better than winner1
-        reporter = reporter2
-
-    if reporting:
-        return (optimum,reporter)
-        
-    return optimum
+    
+    return standardizedstrategy
 
 # let's abstract out getting the AT strategy so we can use it elsewhere
 def getATstrategy(metric,params,timepercycle,waitperiod=True):
@@ -1088,7 +1070,7 @@ def get_final_optimum2(strategy,metric,params,timepercycle,waitperiod=True,beta0
     # make the sequential strategies
     seqstrategy01 = make_sequential(params,timepercycle,waitperiod=waitperiod,drugorder=[0,1])
     seqanalyticalt01,seqanalyticaly01 = GDRSanalytical(y0,seqstrategy01,timepercycle, *params)
-    seqstrategy10 = make_sequential(params,timepercycle,waitperiod=waitperiod,drugorder=[0,1])
+    seqstrategy10 = make_sequential(params,timepercycle,waitperiod=waitperiod,drugorder=[1,0])
     seqanalyticalt10,seqanalyticaly10 = GDRSanalytical(y0,seqstrategy10,timepercycle, *params)
 
     # create the second-strike schedules
@@ -1371,7 +1353,7 @@ def isATpredictedoptimum(params,timepercycle,waitperiod=True):
     return 0
 
 # code for plotting the phase diagram
-def plotphasediagram(storage,phasespace,storagereport,timepercycle,rvals,svals,rvalsX,svalsY,gamma,delta,metric):
+def plotphasediagram(storage,phasespace,timepercycle,rvals,svals,rvalsX,svalsY,gamma,delta,metric,waitperiod=True):
     deltar = (rvals[1] - rvals[0]) / gamma * 0.9
     deltas = (svals[1] - svals[0]) / gamma * 0.9
     fig = plt.figure(777,figsize=(56,32))
@@ -1429,15 +1411,20 @@ def plotphasediagram(storage,phasespace,storagereport,timepercycle,rvals,svals,r
         relative_bottom_left_ys = [-deltas / 2 for kk in range(nwindows)]
         rcenter = rvalsX[kk]
         scenter = svalsY[kk]
-        # determine the color to plot based on which schedule is returned as optimal
-        if storagereport[kk] == 'E':
-            squarecolor = '#6699CC'
-
-        if storagereport[kk] == 'T':
-            squarecolor = '#7fc97f'
-
-        if storagereport[kk] == 'MTD':
+        # determine the color to plot based on the profile of the optimal schedule
+        tvals,yvals = GDRSanalytical([1e12] + [1 for jj in phasespace[kk][1]],storage[kk],timepercycle, *phasespace[kk])
+        profile = schedule_profiler_1(storage[kk],tvals,yvals,timepercycle,waitperiod=True)
+        if profile[2] >= 0:
+            # continuous is dominant
             squarecolor = '#fdc086'
+        else:
+            # it's adaptive
+            if profile[0] <= profile[1]:
+                # T-type, which wins the ties
+                squarecolor = '#7fc97f'
+            else:
+                # profile[0] > profile[1] = E-type
+                squarecolor = '#6699CC'
         
         # plot big rectangle around the whole thing
         square = patches.Rectangle((rcenter + relative_bottom_left_xs[0], scenter + relative_bottom_left_ys[0]), deltar, deltas, linewidth=3, edgecolor='k', facecolor=squarecolor)
@@ -1454,72 +1441,117 @@ def plotphasediagram(storage,phasespace,storagereport,timepercycle,rvals,svals,r
     elif metric == 'CURE':
         plt.title('Minimize tumor burden',fontsize=27)
 
-    # Next, find when our analytical metrics predict that the schedule should be T type or E type
-    plt.figure(349827349,figsize=(56,32))
-    ax = plt.gca()
-    for kk in range(len(storage)):
-        # loop through the schedule and plot drug on/off
-        nwindows = len(storage[kk])
-        squarewidth = deltar / nwindows
-        squareheight = deltas 
-        relative_bottom_left_xs = [-deltar / 2 + kk * squarewidth for kk in range(nwindows)]
-        relative_bottom_left_ys = [-deltas / 2 for kk in range(nwindows)]
-        rcenter = rvalsX[kk]
-        scenter = svalsY[kk]
-        
-        # plot the function that needs to be zero for E type to be possible
-        rr = rcenter * gamma
-        ss = scenter * gamma
-        dt1 = timepercycle # dose time
-        fxntoeval = lambda x: gamma * dt1 + delta * x / rr * (np.exp(-rr * dt1) - 1) + gamma / ss * np.log((1 - x * np.exp(-rr * dt1)) / ((1 - x) * np.exp(-rr * dt1)))
-        xevalvals = np.array([xx/100 for xx in range(1,100)])
-        yevalvals = np.array([fxntoeval(xx) for xx in xevalvals])
-        # scale t values to the x values of the rectangle. sol.t[0] = rcenter - deltar / 2, sol.t[-1] = rcenter + deltar / 2
-        # scale log10(y) values to the y values of the rectangle. y = 1 is scenter - deltas / 2, y = 2e12 is scenter + deltas / 2
-        # all y values less than 1 get set to 1, all > 2e12 get set to 2e12
-        tX = [lintransform(tt,xevalvals[0],xevalvals[-1],rcenter - deltar / 2,rcenter + deltar / 2) for tt in xevalvals]
-        censoredy = [0 if yy < 0 else 1 if yy > 1 else yy for yy in yevalvals]
-        yY = [lintransform(yy,0,1,scenter - deltas / 2,scenter + deltas / 2) for yy in censoredy]
-        if 0 in censoredy:
-            # E type is possible, make it blue
-            ax.plot(tX,yY,'-',linewidth=4,color='#6699CC')
-        else:
-            # not possible, make it red
-            ax.plot(tX,yY,'-',linewidth=4,color='#fdc086')
-            
-        # plot big rectangle around the whole thing. Color of edge is the categorization our method for parsing into T, E, cts gave
-        if storagereport[kk] == 'E':
-            edgecolor = '#6699CC'
-
-        if storagereport[kk] == 'T':
-            edgecolor = '#7fc97f'
-
-        if storagereport[kk] == 'MTD':
-            edgecolor = '#fdc086'
-            
-        square = patches.Rectangle((rcenter + relative_bottom_left_xs[0], scenter + relative_bottom_left_ys[0]), deltar, deltas, linewidth=3, edgecolor=edgecolor, facecolor='none')
-        ax.add_patch(square)
-        predictedAT = isATpredictedoptimum(phasespace[kk],timepercycle,waitperiod=True)
-        if predictedAT:
-            # AT is possible, mark it with green
-            plt.plot(rr/gamma,ss/gamma,'*',markersize=30,color='#7fc97f')
-
-    #plt.plot(rvalsX,svalsY,'k.')
-    plt.locator_params(nbins=4)
-    plt.xticks(fontsize=70)
-    plt.yticks(fontsize=70)
-    plt.xlabel('r / gamma',fontsize=75)
-    plt.ylabel('s / gamma',fontsize=75)
-    if metric == 'PFS':
-        plt.title('Maximize PFS',fontsize=84)
-    elif metric == 'CURE':
-        plt.title('Minimize tumor burden',fontsize=84)
-    
-    plt.show()
     return
 
+def schedule_profiler_1(schedule,tvals,yvals,timepercycle,waitperiod=True):
+    # want to get a score for E type, T type, and cts
+    # for cts, just count fraction of doses that are right after previous. This seems to work well
+    # for E/T type, count the number of doses where E is making the decision vs T making the decision
+    
+    indices = [kk for kk in range(len(schedule)) if schedule[kk] == {0}] # indices where a dose happened
+    if len(indices) < 2:
+        return [1,0,1] # can't tell what schedule it is with just one dose, default to continuous and E-type
+        
+    diffs = [indices[kk+1] - indices[kk] for kk in range(len(indices) - 1)] # time between doses
+    # get the T and E values at the start of the dose periods
+    periodstarttindices = [kk for kk in range(len(tvals)) if tvals[kk] % timepercycle == 0] # pick out the relevant time values, the ones at period starts
+    dosestartyvals = [yvals[periodstarttindices[kk]] for kk in indices] # pick out the relevant y values, the ones at period starts that also had drug
+    dosestartTs = [yy[0] for yy in dosestartyvals]
+    dosestartEs = [yy[1] for yy in dosestartyvals]
+    dosestartTforcomparison = [np.log(yy/curethresh) / np.log(progthresh/curethresh) for yy in dosestartTs] # scale these so that T = curethresh gives 0 and T = progthresh is 1. Then we can directly compare to E
+    Ewins = sum([EE > TT for EE,TT in zip(dosestartEs,dosestartTforcomparison)])
+    Twins = len(indices) - Ewins
+    etypescore = Ewins / len(indices)
+    ttypescore = Twins / len(indices)
+    # Continuous score is how close together the doses are, on average. If ctsscore > 0, then average dose time difference is within one period of the minimum allowable
+    if waitperiod:
+        ctsscore = 1 - (np.mean(diffs) - 2) 
+    else:
+        ctsscore = 1 - (np.mean(diffs) - 1) 
+        
+    return [etypescore,ttypescore,ctsscore]
+
+def calculateobjectives(tvals,yvals):
+    # return the cure time, min tumor burden, and PFS time of a schedule
+    return {'curetime':calculatecuretime(tvals,yvals), 'PFStime':PFStime(tvals,yvals), 'mintumorburden':mintumorburden(tvals,yvals)}
+
+def schedule_profiler_2(schedule,tvals,yvals,params,timepercycle,metric,waitperiod=True,x=0.05):
+    # want to assess the returned 2 drug schedules in terms of the sequential, second-strike, and alternating schedule
+    # test to see if the objective is within x percent in a cascade from clinically easiest to hardest
+    # if so, report that schedule and the fraction error
+    # at the end, assign as curative / non-curative AT
+    # returns (assignment, fraction worse than SA)
+    # if schedule is one of these exactly, take that one
+
+    y0 = [1e12] + [1 for kk in range(len(params[1]))]
+    SAobjectives = calculateobjectives(tvals,yvals)
+    comparisonfactor = 1 + x # we want shorter cure times or lower min TB, but we will allow up to x% higher
+    comparisonfactorPFS = 1 - x # we want longer PFS times, but we will allow up to x% lower
+
+    # make all the strategies and do the comparison first.
+    seqstrategy01 = make_sequential(params,timepercycle,waitperiod=waitperiod,drugorder=[0,1])
+    seqstrategy10 = make_sequential(params,timepercycle,waitperiod=waitperiod,drugorder=[0,1])
+    ssstrategy01 = make_second_strike(params,timepercycle,waitperiod=waitperiod,drugorder=[0,1])
+    ssstrategy10 = make_second_strike(params,timepercycle,waitperiod=waitperiod,drugorder=[1,0])
+    altstrategy01 = make_alternating(params,timepercycle,metric,waitperiod=waitperiod,drugorder=[0,1])
+    altstrategy10 = make_alternating(params,timepercycle,metric,waitperiod=waitperiod,drugorder=[1,0])
+
+    if schedule == seqstrategy01 or schedule == seqstrategy10:
+        return ('sequential',0)
+
+    if schedule == ssstrategy01 or schedule == ssstrategy10:
+        return ('second-strike',0)
+
+    if schedule == altstrategy01 or schedule == altstrategy10:
+        return ('alternating',0)
+    
+    # Test sequential
+    seqanalyticalt01,seqanalyticaly01 = GDRSanalytical(y0,seqstrategy01,timepercycle, *params)
+    seq01objectives = calculateobjectives(seqanalyticalt01,seqanalyticaly01)
+    seqanalyticalt10,seqanalyticaly10 = GDRSanalytical(y0,seqstrategy10,timepercycle, *params)
+    seq10objectives = calculateobjectives(seqanalyticalt10,seqanalyticaly10)
+    if seq01objectives['curetime'] < SAobjectives['curetime'] * comparisonfactor or seq10objectives['curetime'] < SAobjectives['curetime'] * comparisonfactor:
+        return ('sequential',min([seq01objectives['curetime'] / SAobjectives['curetime'] - 1, seq10objectives['curetime'] / SAobjectives['curetime'] - 1]))
+    elif metric == 'CURE' and (seq01objectives['mintumorburden'] < SAobjectives['mintumorburden'] * comparisonfactor or seq10objectives['mintumorburden'] < SAobjectives['mintumorburden'] * comparisonfactor):
+        return ('sequential',min([seq01objectives['mintumorburden'] / SAobjectives['mintumorburden'] - 1, seq10objectives['mintumorburden'] / SAobjectives['mintumorburden'] - 1]))
+    elif metric == 'PFS' and (seq01objectives['PFStime'] > SAobjectives['PFStime'] * comparisonfactorPFS or seq10objectives['PFStime'] > SAobjectives['PFStime'] * comparisonfactorPFS):
+        return ('sequential',min([1 - seq01objectives['PFStime'] / SAobjectives['PFStime'], 1 - seq10objectives['PFStime'] / SAobjectives['PFStime']]))
+
+    # Test second-strike
+    ssanalyticalt01,ssanalyticaly01 = GDRSanalytical(y0,ssstrategy01,timepercycle, *params)
+    ss01objectives = calculateobjectives(ssanalyticalt01,ssanalyticaly01)
+    ssanalyticalt10,ssanalyticaly10 = GDRSanalytical(y0,ssstrategy10,timepercycle, *params)
+    ss10objectives = calculateobjectives(ssanalyticalt10,ssanalyticaly10)
+    if ss01objectives['curetime'] < SAobjectives['curetime'] * comparisonfactor or ss10objectives['curetime'] < SAobjectives['curetime'] * comparisonfactor:
+        return ('second-strike',min([ss01objectives['curetime'] / SAobjectives['curetime'] - 1, ss10objectives['curetime'] / SAobjectives['curetime'] - 1]))
+    elif metric == 'CURE' and (ss01objectives['mintumorburden'] < SAobjectives['mintumorburden'] * comparisonfactor or ss10objectives['mintumorburden'] < SAobjectives['mintumorburden'] * comparisonfactor):
+        return ('second-strike',min([ss01objectives['mintumorburden'] / SAobjectives['mintumorburden'] - 1, ss10objectives['mintumorburden'] / SAobjectives['mintumorburden'] - 1]))
+    elif metric == 'PFS' and (ss01objectives['PFStime'] > SAobjectives['PFStime'] * comparisonfactorPFS or ss10objectives['PFStime'] > SAobjectives['PFStime'] * comparisonfactorPFS):
+        return ('second-strike',min([1 - ss01objectives['PFStime'] / SAobjectives['PFStime'], 1 - ss10objectives['PFStime'] / SAobjectives['PFStime']]))
+
+    # Test alternating
+    altanalyticalt01,altanalyticaly01 = GDRSanalytical(y0,altstrategy01,timepercycle, *params)
+    alt01objectives = calculateobjectives(altanalyticalt01,altanalyticaly01)
+    altanalyticalt10,altanalyticaly10 = GDRSanalytical(y0,altstrategy10,timepercycle, *params)
+    alt10objectives = calculateobjectives(altanalyticalt10,altanalyticaly10)
+    if alt01objectives['curetime'] < SAobjectives['curetime'] * comparisonfactor or alt10objectives['curetime'] < SAobjectives['curetime'] * comparisonfactor:
+        return ('alternating',min([alt01objectives['curetime'] / SAobjectives['curetime'] - 1, alt10objectives['curetime'] / SAobjectives['curetime'] - 1]))
+    elif metric == 'CURE' and (alt01objectives['mintumorburden'] < SAobjectives['mintumorburden'] * comparisonfactor or alt10objectives['mintumorburden'] < SAobjectives['mintumorburden'] * comparisonfactor):
+        return ('alternating',min([alt01objectives['mintumorburden'] / SAobjectives['mintumorburden'] - 1, alt10objectives['mintumorburden'] / SAobjectives['mintumorburden'] - 1]))
+    elif metric == 'PFS' and (alt01objectives['PFStime'] > SAobjectives['PFStime'] * comparisonfactorPFS or alt10objectives['PFStime'] > SAobjectives['PFStime'] * comparisonfactorPFS):
+        return ('alternating',min([1 - alt01objectives['PFStime'] / SAobjectives['PFStime'], 1 - alt10objectives['PFStime'] / SAobjectives['PFStime']]))
+
+    # if none of the above, parse as curative or non-curative at
+    if SAobjectives['curetime'] < np.inf:
+        # we cured
+        return ('curativeAT',0)
+
+    # did not cure
+    return ('non-curativeAT',0)
+    
+
 # code for plotting the phase diagram
-def plotphasediagram2(storage,phasespace,storagereport,timepercycle,rvals,svals,rvalsX,svalsY,gamma,metric):
+def plotphasediagram2(storage,phasespace,timepercycle,rvals,svals,rvalsX,svalsY,gamma,metric,waitperiod=True):
     deltar = (rvals[1] - rvals[0]) / gamma * 0.9
     deltas = (svals[1] - svals[0]) / gamma * 0.9
     fig = plt.figure(777,figsize=(56,32))
@@ -1570,11 +1602,13 @@ def plotphasediagram2(storage,phasespace,storagereport,timepercycle,rvals,svals,
     
     plt.show()
 
-    # do the same thing, but plot colored rectangles instead depending on what the overall optimum was reported as to show the phase boundaries
+    # do the same thing, but plot colored rectangles instead depending on the parsing
+    # include the error in the parsing as text over the square
     fig = plt.figure(888,figsize=(15,8))
     ax = plt.gca()
     for kk in range(len(storage)):
         # loop through the schedule and plot drug on/off
+        params = phasespace[kk]
         nwindows = len(storage[kk])
         squarewidth = deltar / nwindows
         squareheight = deltas 
@@ -1582,25 +1616,32 @@ def plotphasediagram2(storage,phasespace,storagereport,timepercycle,rvals,svals,
         relative_bottom_left_ys = [-deltas / 2 for kk in range(nwindows)]
         rcenter = rvalsX[kk]
         scenter = svalsY[kk]
-        # determine the color to plot based on which schedule is returned as optimal
-        if storagereport[kk] == 'CURE':
+        # determine the color to plot based on which schedule it parses to
+        tvals,yvals = GDRSanalytical([1e12] + [1 for kk in params[1]],storage[kk],timepercycle, *params)
+        scoring = schedule_profiler_2(storage[kk],tvals,yvals,params,timepercycle,metric,waitperiod=waitperiod)
+        stringtoprint = ''
+        if scoring[0] == 'curativeAT':
             squarecolor = '#6699CC'
 
-        if storagereport[kk] == 'SA':
+        if scoring[0] == 'non-curativeAT':
             squarecolor = '#8AE378' # slight perturbation of the green
         
-        if storagereport[kk] == 'ALT':
+        if scoring[0] == 'alternating':
             squarecolor = '#beaed4'
+            stringtoprint = '{:.1e}'.format(scoring[1])
 
-        if storagereport[kk] == 'SEQ':
+        if scoring[0] == 'sequential':
             squarecolor = '#fdc086'
+            stringtoprint = '{:.1e}'.format(scoring[1])
 
-        if storagereport[kk] == 'SS':
+        if scoring[0] == 'second-strike':
             squarecolor = '#ffff99'
+            stringtoprint = '{:.1e}'.format(scoring[1])
         
         # plot big rectangle around the whole thing
         square = patches.Rectangle((rcenter + relative_bottom_left_xs[0], scenter + relative_bottom_left_ys[0]), deltar, deltas, linewidth=3, edgecolor='k', facecolor=squarecolor)
         ax.add_patch(square)
+        plt.text(rcenter, scenter, stringtoprint, fontsize=10, color="k", ha='center', va='center')
 
     #plt.plot(rvalsX,svalsY,'k.')
     plt.locator_params(nbins=4)
@@ -1615,6 +1656,8 @@ def plotphasediagram2(storage,phasespace,storagereport,timepercycle,rvals,svals,
 
     return
 
+    
+# This one needs to be fixed.
 def infinitesimalphaseboundaryplot(storage,phasespace,storagereport,timepercycle,rvals,svals,rvalsX,svalsY,gamma,delta,metric,smin,smax):
     # Next, find when our analytical metrics predict that the schedule should be T type or E type
     deltar = (rvals[1] - rvals[0]) / gamma * 0.9
